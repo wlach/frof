@@ -1,0 +1,198 @@
+#!/usr/bin/env python
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this file,
+# You can obtain one at http://mozilla.org/MPL/2.0/.
+
+import mozdevice
+import os
+import StringIO
+import time
+import tempfile
+import subprocess
+import sys
+import optparse
+import zipfile
+
+GECKO_PROFILER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                                  "../src/GeckoProfilerAddon"))
+
+def getDevicePrefs(options):
+    '''Gets a dictionary of eideticker device parameters'''
+    optionDict = {}
+    if options.dmtype:
+        optionDict['dmtype'] = options.dmtype
+    else:
+        optionDict['dmtype'] = os.environ.get('DM_TRANS', 'adb')
+
+    host = options.host
+    if not host and optionDict['dmtype'] == "sut":
+        host = os.environ.get('TEST_DEVICE')
+
+    optionDict['host'] = host
+    optionDict['port'] = options.port
+
+    return optionDict
+
+def getDevice(dmtype="adb", host=None, port=None):
+    '''Gets an eideticker device according to parameters'''
+
+    print "Using %s interface (host: %s, port: %s)" % (dmtype, host, port)
+    if dmtype == "adb":
+        if host and not port:
+            port = 5555
+        return mozdevice.DroidADB(packageName=None, host=host, port=port)
+    elif dmtype == "sut":
+        if not host:
+            raise Exception("Must specify host with SUT!")
+        if not port:
+            port = 20701
+        return mozdevice.DroidSUT(host=host, port=port)
+    else:
+        raise Exception("Unknown device manager type: %s" % type)
+
+def getPIDs(device, appname):
+    '''FIXME: Total hack, put this in devicemanagerADB instead'''
+    procs = device.getProcessList()
+    pids = []
+    for (pid, name, user) in procs:
+        if name == appname:
+            pids.append(pid)
+    return pids
+
+def shellCheckOutput(device, args):
+    buf = StringIO.StringIO()
+    retval = device.shell(args, buf, root=True)
+    output = str(buf.getvalue()[0:-1]).rstrip()
+    if retval == None:
+        raise Exception("Did not successfully run command %s (output: '%s', retval: 'None')" % (args, output))
+    if retval != 0:
+        raise Exception("Non-zero return code for command: %s (output: '%s', retval: '%i')" % (args, output, retval))
+    return output
+
+def getAPK(device, appname, localfile):
+    remote_tempfile = '/data/local/apk-tmp-%s' % time.time()
+    for remote_apk_path in [ '/data/app/%s-1.apk' % appname,
+                             '/data/app/%s-2.apk' % appname ]:
+        try:
+            shellCheckOutput(device, ['dd', 'if=%s' % remote_apk_path,
+                                      'of=%s' % remote_tempfile])
+            shellCheckOutput(device, ['chmod', '0666', remote_tempfile])
+            if device.getFile(remote_tempfile, localfile):
+                device.removeFile(remote_tempfile)
+                return
+        except:
+            continue
+
+    raise Exception("Unable to get remote APK for %s!" % appname)
+
+def get_profile_and_symbols(device, appname, profile_location, target_zip):
+    files_to_package = []
+
+    # create a temporary directory to place the profile and shared libraries
+    tmpdir = tempfile.mkdtemp()
+
+    # remove previous profiles if there is one
+    profile_path = os.path.join(tmpdir, "fennec_profile.txt")
+    if os.path.exists(profile_path):
+        os.remove(profile_path)
+
+    print "Fetching fennec_profile.txt"
+    device.getFile(profile_location, profile_path)
+    files_to_package.append(profile_path)
+
+    print "Fetching app symbols"
+    try:
+        local_apk_path = os.path.join(tmpdir, "symbol.apk")
+        getAPK(device, appname, local_apk_path)
+        files_to_package.append(local_apk_path)
+    except:
+        print "WARNING: Failed to fetch app symbols"
+        pass # We still get a useful profile without the symbols from the apk
+
+    # get all the symbols library for symbolication
+    print "Fetching system libraries"
+    libpaths = [ "/system/lib",
+                 "/system/lib/egl",
+                 "/system/lib/hw",
+                 "/system/vendor/lib",
+                 "/system/vendor/lib/egl",
+                 "/system/vendor/lib/hw",
+                 "/system/b2g" ]
+
+    for libpath in libpaths:
+        print "Fetching from: " + libpath
+        dirlist = device.listFiles(libpath)
+        for filename in dirlist:
+            filename = filename.strip()
+            if filename.endswith(".so"):
+                try:
+                    lib_path = os.path.join(tmpdir, filename)
+                    results = device.getFile(libpath + '/' + filename, lib_path)
+                    if results != None:
+                        files_to_package.append(lib_path);
+                except subprocess.CalledProcessError:
+                    print "failed to fetch: %s" % filename
+
+    with zipfile.ZipFile(target_zip, "w") as zip_file:
+        for file_to_package in files_to_package:
+            zip_file.write(file_to_package, os.path.basename(file_to_package))
+
+def main(args=sys.argv[1:]):
+    usage = "usage: %prog [options] <appname> <url> <profile file>"
+    parser = optparse.OptionParser(usage=usage)
+    parser.add_option("--host", action="store",
+                      type = "string", dest = "host",
+                      help = "Device hostname (only if using TCP/IP)",
+                      default=None)
+    parser.add_option("-p", "--port", action="store",
+                    type = "int", dest = "port",
+                    help = "Custom device port (if using SUTAgent or "
+                    "adb-over-tcp)", default=None)
+    parser.add_option("-m", "--dm-type", action="store",
+                      type = "string", dest = "dmtype",
+                      help = "DeviceManager type (adb or sut, defaults to adb)")
+
+    options, args = parser.parse_args()
+    if len(args) != 3:
+        parser.error("incorrect number of arguments")
+        sys.exit(1)
+
+    prefs = getDevicePrefs(options)
+    device = getDevice(**prefs)
+
+    (appname, url, profile_file) = args
+    if not device.launchFennec(appname, url=url,
+                               mozEnv={ "MOZ_PROFILER_STARTUP": "true" }):
+        print "Failed to launch %s" % appname
+        sys.exit(1)
+
+    print "Starting %s in profiling mode. Press enter when done." % appname
+    raw_input()
+    print "Done!"
+    with tempfile.NamedTemporaryFile() as profile_package:
+        print "Saving profile..."
+        pids = getPIDs(device, appname)
+        if not pids:
+            print "Er, app doesn't seem to be running?"
+            sys.exit(1)
+        shellCheckOutput(device, ['kill', '-s', '12', pids[0]])
+
+        raw_profile_location = "/mnt/sdcard/profile_0_%s.txt" % pids[0]
+        # Saving goes through the main event loop so give it time to flush
+        time.sleep(10)
+
+        print "Killing application..."
+        device.killProcess(appname)
+
+        print "Getting profile..."
+        get_profile_and_symbols(device, appname, raw_profile_location,
+                                profile_package.name)
+        device.removeFile(raw_profile_location)
+
+        print "Symbolicating profile..."
+        subprocess.call(["./symbolicate.sh", os.path.abspath(profile_package.name),
+                         os.path.abspath(profile_file)],
+                        cwd=GECKO_PROFILER_DIR)
+
+main()

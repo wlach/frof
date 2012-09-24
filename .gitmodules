@@ -1,0 +1,3 @@
+[submodule "src/GeckoProfilerAddon"]
+	path = src/GeckoProfilerAddon
+	url = git://github.com/bgirard/Gecko-Profiler-Addon.git
